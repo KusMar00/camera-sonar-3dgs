@@ -1,0 +1,15 @@
+# Notebook kernel
+ipykernel
+
+# Data handling / EDA
+numpy
+pandas
+matplotlib
+opencv-python
+pyyaml
+tqdm
+
+# Dataset download / extraction / reading
+py7zr
+gdown
+rosbags
