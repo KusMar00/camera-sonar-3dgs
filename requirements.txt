@@ -13,3 +13,10 @@ tqdm
 py7zr
 gdown
 rosbags
+
+# 3D model loading / visualization
+trimesh
+fast-simplification
+scipy
+plotly
+nbformat
