@@ -63,6 +63,46 @@ def load_recording(rec: Path, polar: bool = True) -> dict:
     }
 
 
+def inventory(recordings: list[Path]) -> pd.DataFrame:
+    """One row per recording: what it shows, how many frames each modality has, and whether it is usable.
+
+    Only counts files and reads a few metadata columns, so it is fast for the whole dataset.
+    `usable` is "camera+sonar" (GoPro frames, sonar frames, and poses all present), "sonar only"
+    (GoPro footage lost), or "unusable" (no sonar frames or no poses).
+    """
+    def count(d: Path) -> set[int]:
+        return {int(f.stem) for f in d.iterdir()} if d.is_dir() else set()
+
+    rows = []
+    for rec in recordings:
+        sonar_dir = rec / "aris_polar" if (rec / "aris_polar").is_dir() else rec / "aris_raw"
+        sonar, gopro, labels = count(sonar_dir), count(rec / "gopro"), count(rec / "labels")
+        gantry = pd.read_csv(rec / "gantry.csv", index_col="aris_frame_idx")
+        meta = pd.read_csv(rec / "aris_frame_meta.csv", index_col="FrameIndex", usecols=["FrameIndex", "SonarTilt", "SonarPan"])
+        posed = gantry.index.intersection(meta.index)
+        notes = (rec / "notes.txt").read_text().splitlines() if (rec / "notes.txt").exists() else []
+        trajectory = next((l.split(":", 1)[1].strip() for l in notes if l.lower().startswith("- trajectory")), "")
+        pan = np.degrees(np.unwrap(np.radians(meta["SonarPan"].sort_index().to_numpy())))  # flybys sit at +-180
+
+        missing = [name for name, n in (("sonar", sonar), ("gopro", gopro), ("labels", labels), ("poses", posed)) if not len(n)]
+        usable = ("unusable" if not sonar or posed.empty else "camera+sonar" if gopro else "sonar only")
+        rows.append({
+            "target": rec.parent.name,
+            "recording": rec.name,
+            "trajectory": trajectory,
+            "gantry z [m]": round(gantry["z"].median(), 2),
+            "tilt [deg]": round(meta["SonarTilt"].median()),
+            "pan [deg]": f"{pan.min():.0f} to {pan.max():.0f}",
+            "pan span [deg]": round(np.ptp(pan)),  # how far around the target the view sweeps
+            "sonar frames": len(sonar),
+            "gopro frames": len(gopro),
+            "labelled frames": len(labels & gopro),
+            "missing": ", ".join(missing),
+            "usable": usable,
+        })
+    return pd.DataFrame(rows)
+
+
 def label_box(label: dict) -> np.ndarray:
     """Label bounding box as [x_min, y_min, x_max, y_max] in full-HD GoPro pixels."""
     return LABEL_SCALE * np.array([label["x_min"], label["y_min"], label["x_max"], label["y_max"]], float)
