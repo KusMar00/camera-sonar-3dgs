@@ -21,11 +21,15 @@ import pandas as pd
 import yaml
 from scipy.spatial.transform import Rotation as R
 
-# Label class -> target frame in transforms.yaml
+# Recording folder (recordings/<target_type>/) -> target frame in transforms.yaml.
+# Keyed by folder, not label class: the floor recordings reuse the "100lbs_aircraft_bomb" label
+# class but sit at target/100lbs_floor, and some recordings have no labels at all.
 TARGET_FRAMES = {
-    "100lbs_aircraft_bomb": "target/100lbs",
-    "mortar_shell": "target/mortar_shell",
-    "incindiary_grenade": "target/incendiary",
+    "100lbs_bomb": "target/100lbs",
+    "100lbs_bomb_(floor)": "target/100lbs_floor",
+    "15cm_mortar": "target/mortar_shell",
+    "20lbs_incendiary": "target/incendiary",
+    "test_cylinder": "target/cylinder",
 }
 
 LABEL_SCALE = 3  # labels are in 640x360 (SD) pixels, GoPro frames are 1920x1080 (FHD)
@@ -36,15 +40,20 @@ LABEL_SCALE = 3  # labels are in 640x360 (SD) pixels, GoPro frames are 1920x1080
 
 
 def load_recording(rec: Path, polar: bool = True) -> dict:
-    """Sonar frames, GoPro frames, labels, gantry rows, and per-frame ARIS metadata of one recording."""
+    """Sonar frames, GoPro frames, labels, gantry rows, and per-frame ARIS metadata of one recording.
+
+    Some recordings lost their GoPro footage (see notes.txt); they get empty `gopro_frames`.
+    """
     sonar_dir = rec / "aris_polar" if polar and (rec / "aris_polar").is_dir() else rec / "aris_raw"
     notes = rec / "notes.txt"
+    gopro_dir = rec / "gopro"
     labels_dir = rec / "labels"
     return {
         "name": rec.name,
         "target": rec.parent.name,
+        "target_frame": TARGET_FRAMES[rec.parent.name],
         "sonar_frames": {int(f.stem): f for f in sorted(sonar_dir.iterdir())},
-        "gopro_frames": {int(f.stem): f for f in sorted((rec / "gopro").iterdir())},
+        "gopro_frames": {int(f.stem): f for f in sorted(gopro_dir.iterdir())} if gopro_dir.is_dir() else {},
         "labels": {int(f.stem): json.loads(f.read_text()) for f in sorted(labels_dir.glob("*.json"))}
         if labels_dir.is_dir() else {},
         "gantry": pd.read_csv(rec / "gantry.csv", index_col="aris_frame_idx"),
