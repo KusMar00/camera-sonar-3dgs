@@ -28,9 +28,11 @@ CAMERA_INTRINSICS = {
     "marina": (np.array([[1048.9128, 0, 938.53824], [0, 1044.4716, 495.39543], [0, 0, 1]]),
                np.array([-0.028647, 0.001474, -0.007251, -0.003957, 0.0])),
 }
-# "Transformation Matrix Sonar to Camera" (Ts_c), as given. Rotation swaps the axes, camera ~15 cm from the sonar.
-# Which direction it maps (sonar->camera or camera->sonar) is not verified yet.
-T_SONAR_CAMERA = np.array([[0.0, -1.0, 0.0, 0.0],
+# "Transformation Matrix Sonar to Camera" (Ts_c) from the config. The authors' merge.py applies it as
+# p_camera = R @ p_sonar + t, so it maps sonar-frame points into the camera frame: T_camera_sonar.
+# Sonar frame: x forward, y left, z up. Camera frame (OpenCV): x right, y down, z forward.
+# The camera looks along the sonar's x axis and sits 15 cm behind the sonar.
+T_CAMERA_SONAR = np.array([[0.0, -1.0, 0.0, 0.0],
                            [0.0, 0.0, -1.0, 0.0],
                            [1.0, 0.0, 0.0, 0.15],
                            [0.0, 0.0, 0.0, 1.0]])
@@ -158,3 +160,95 @@ def polar_to_fan(polar: np.ndarray, bearings: np.ndarray, range_resolution: floa
     map_y = (np.hypot(forward, lateral) / range_resolution).astype(np.float32)
     map_x = np.interp(bearing, bearings, np.arange(len(bearings)), left=-1, right=-1).astype(np.float32)
     return cv2.remap(polar, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+# ---------------------------------------------------------------------------
+# Sequences and poses
+
+
+def load_sequence(bag: Path) -> dict:
+    """All camera frames of a bag, each paired with the nearest sonar ping and the interpolated odometry pose.
+
+    Sync is by header timestamp. Camera frames outside the odometry time range are dropped. Returns
+    {"frames": DataFrame, one row per kept camera frame (t [s], camera/ping index, ping time offset,
+               interpolated pose x, y, z, qx, qy, qz, qw),
+     "cameras": camera messages, "pings": sonar messages, "odom": DataFrame of the raw odometry}.
+    """
+    from scipy.spatial.transform import Rotation, Slerp
+
+    ts = make_typestore(bag)
+    cameras = [m for _, m in read_topic(bag, CAMERA_TOPIC, ts)]
+    pings = [m for _, m in read_topic(bag, SONAR_TOPIC, ts)]
+    odom = pd.DataFrame([
+        dict(t_ns=stamp_ns(m), x=m.pose.pose.position.x, y=m.pose.pose.position.y, z=m.pose.pose.position.z,
+             qx=m.pose.pose.orientation.x, qy=m.pose.pose.orientation.y,
+             qz=m.pose.pose.orientation.z, qw=m.pose.pose.orientation.w)
+        for _, m in read_topic(bag, ODOM_TOPIC, ts)
+    ]).sort_values("t_ns").drop_duplicates("t_ns").reset_index(drop=True)
+
+    t_cam = np.array([stamp_ns(m) for m in cameras])
+    t_ping = np.array([stamp_ns(m) for m in pings])
+    keep = np.flatnonzero((t_cam >= odom["t_ns"].iloc[0]) & (t_cam <= odom["t_ns"].iloc[-1]))
+
+    # Nearest ping per camera frame
+    order = np.argsort(t_ping)
+    j = np.clip(np.searchsorted(t_ping[order], t_cam[keep]), 1, len(order) - 1)
+    left, right = order[j - 1], order[j]
+    ping_idx = np.where(np.abs(t_ping[left] - t_cam[keep]) <= np.abs(t_ping[right] - t_cam[keep]), left, right)
+
+    # Pose at the camera time: linear for position, slerp for rotation
+    t_odom = odom["t_ns"].to_numpy()
+    t_rel = lambda t: (t - t_odom[0]) / 1e9   # seconds, to keep the interpolation well conditioned
+    pos = np.column_stack([np.interp(t_cam[keep], t_odom, odom[c]) for c in "xyz"])
+    rot = Slerp(t_rel(t_odom), Rotation.from_quat(odom[["qx", "qy", "qz", "qw"]].to_numpy()))(t_rel(t_cam[keep]))
+
+    frames = pd.DataFrame({
+        "t": t_cam[keep] / 1e9,
+        "camera_idx": keep,
+        "ping_idx": ping_idx,
+        "ping_dt_ms": (t_ping[ping_idx] - t_cam[keep]) / 1e6,
+        **dict(zip("xyz", pos.T)),
+        **dict(zip(["qx", "qy", "qz", "qw"], rot.as_quat().T)),
+    })
+    return {"frames": frames, "cameras": cameras, "pings": pings, "odom": odom}
+
+
+def sonar_poses(frames: pd.DataFrame, pitch: bool = True) -> np.ndarray:
+    """(N, 4, 4) T_world_sonar from the interpolated odometry.
+
+    The authors treat the odometry pose as the sonar pose. With `pitch=False`, pitch is zeroed as in
+    their merge.py (euler_matrix(roll, 0, yaw), static xyz convention).
+    """
+    from scipy.spatial.transform import Rotation
+
+    rot = Rotation.from_quat(frames[["qx", "qy", "qz", "qw"]].to_numpy())
+    if not pitch:
+        rpy = rot.as_euler("xyz")
+        rpy[:, 1] = 0
+        rot = Rotation.from_euler("xyz", rpy)
+    T = np.tile(np.eye(4), (len(frames), 1, 1))
+    T[:, :3, :3] = rot.as_matrix()
+    T[:, :3, 3] = frames[["x", "y", "z"]].to_numpy()
+    return T
+
+
+def camera_poses(frames: pd.DataFrame, pitch: bool = True) -> np.ndarray:
+    """(N, 4, 4) T_world_camera (OpenCV camera frame) = T_world_sonar @ inv(T_camera_sonar)."""
+    return sonar_poses(frames, pitch) @ np.linalg.inv(T_CAMERA_SONAR)
+
+
+def sonar_points(ping, threshold: int = 100, min_range: float = 0.3) -> tuple[np.ndarray, np.ndarray]:
+    """Bright sonar returns as 3D points in the sonar frame, assuming zero elevation.
+
+    An imaging sonar measures range and bearing but not elevation, so each return is placed in the
+    sonar's horizontal plane. Pixels below `threshold` or closer than `min_range` (near-field noise)
+    are skipped. Returns ((M, 3) points, (M,) intensities). Positive bearing (right side of the fan)
+    maps to negative y, as in the authors' imaging_sonar.py.
+    """
+    s = decode_ping(ping)
+    r_idx, b_idx = np.nonzero(s["polar"] >= threshold)
+    r, b = s["ranges"][r_idx], s["bearings"][b_idx]
+    near = r >= min_range
+    r, b = r[near], b[near]
+    points = np.column_stack([r * np.cos(b), -r * np.sin(b), np.zeros_like(r)])
+    return points, s["polar"][r_idx[near], b_idx[near]]
