@@ -193,6 +193,41 @@ def project(points_world: np.ndarray, T_world_cam: np.ndarray, K: np.ndarray,
     return uv, depth
 
 
+def view_geometry(rec: dict, tfs: dict, K: np.ndarray, dist: np.ndarray,
+                  image_size: tuple[int, int] = (1920, 1080)) -> pd.DataFrame:
+    """Where the camera is relative to the target, per frame.
+
+    Camera position in the target frame (z up) as azimuth (direction around the target, 0-360 deg),
+    elevation (angle above the target), and distance [m], plus whether the target origin projects
+    in front of the camera and inside the image.
+    """
+    import cv2
+
+    poses = rig_poses(rec, tfs, frames=("setup/camera",))
+    T_world_cam = poses["setup/camera"]
+    T_world_target = chain(tfs, rec["target_frame"], "world")
+
+    # Camera position in the target frame
+    p = (np.linalg.inv(T_world_target) @ T_world_cam[:, :, 3].T).T[:, :3]
+    distance = np.linalg.norm(p, axis=1)
+
+    # Target origin in each camera frame, projected in one call
+    target = T_world_target[:3, 3]
+    T_cam_world = np.linalg.inv(T_world_cam)
+    p_cam = np.einsum("nij,j->ni", T_cam_world[:, :3, :3], target) + T_cam_world[:, :3, 3]
+    uv = cv2.fisheye.projectPoints(p_cam[None].astype(np.float64), np.zeros(3), np.zeros(3), K, dist.reshape(4, 1))[0][0]
+    w, h = image_size
+    in_view = (p_cam[:, 2] > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+
+    return pd.DataFrame({
+        "frame_idx": poses["frame_idx"],
+        "azimuth": np.degrees(np.arctan2(p[:, 1], p[:, 0])) % 360,
+        "elevation": np.degrees(np.arcsin(p[:, 2] / distance)),
+        "distance": distance,
+        "in_view": in_view,
+    })
+
+
 # ---------------------------------------------------------------------------
 # 3D models
 
