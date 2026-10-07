@@ -34,6 +34,32 @@ TARGET_FRAMES = {
 
 LABEL_SCALE = 3  # labels are in 640x360 (SD) pixels, GoPro frames are 1920x1080 (FHD)
 
+# ARIS Explorer 3000, 128-beam mode: measured beam centre angles [deg], from the dataset authors'
+# scripts/common/aris_definitions.py (SoundMetrics SDK). Column k of an aris_raw frame looks at
+# -ARIS_BEAMS_128_DEG[k] (positive = right), as in the authors' aris_frame_to_polar2: the columns run
+# right to left, so column 0 is the rightmost beam. Checked against the gantry poses by projecting the
+# 100 lbs bomb into the raw frames.
+ARIS_BEAMS_128_DEG = np.array([
+    -15.0068, -14.7768, -14.5462, -14.3150, -14.0833, -13.8511, -13.6186, -13.3858,
+    -13.1528, -12.9196, -12.6861, -12.4523, -12.2182, -11.9838, -11.7491, -11.5141,
+    -11.2789, -11.0435, -10.8079, -10.5721, -10.3361, -10.0999,  -9.8635,  -9.6269,
+     -9.3902,  -9.1534,  -8.9165,  -8.6795,  -8.4424,  -8.2053,  -7.9682,  -7.7310,
+     -7.4938,  -7.2566,  -7.0193,  -6.7820,  -6.5446,  -6.3072,  -6.0698,  -5.8324,
+     -5.5949,  -5.3574,  -5.1199,  -4.8823,  -4.6447,  -4.4071,  -4.1695,  -3.9318,
+     -3.6941,  -3.4564,  -3.2187,  -2.9809,  -2.7430,  -2.5050,  -2.2669,  -2.0287,
+     -1.7904,  -1.5520,  -1.3135,  -1.0749,  -0.8362,  -0.5974,  -0.3585,  -0.1196,
+      0.1194,   0.3584,   0.5973,   0.8362,   1.0750,   1.3137,   1.5523,   1.7908,
+      2.0292,   2.2675,   2.5057,   2.7438,   2.9818,   3.2197,   3.4575,   3.6952,
+      3.9329,   4.1706,   4.4083,   4.6459,   4.8835,   5.1211,   5.3587,   5.5962,
+      5.8337,   6.0712,   6.3086,   6.5460,   6.7834,   7.0208,   7.2581,   7.4954,
+      7.7326,   7.9698,   8.2070,   8.4441,   8.6812,   8.9183,   9.1553,   9.3922,
+      9.6290,   9.8657,  10.1023,  10.3387,  10.5749,  10.8109,  11.0467,  11.2823,
+     11.5177,  11.7529,  11.9879,  12.2226,  12.4570,  12.6911,  12.9249,  13.1584,
+     13.3916,  13.6246,  13.8574,  14.0899,  14.3221,  14.5538,  14.7850,  15.0156,
+])
+# ARIS Explorer 3000 apertures (manufacturer spec, 3 MHz / 128 beams)
+SONAR_FOV_DEG = {"horizontal": 30.0, "vertical": 14.0}
+
 
 # ---------------------------------------------------------------------------
 # Recordings
@@ -101,6 +127,24 @@ def inventory(recordings: list[Path]) -> pd.DataFrame:
             "usable": usable,
         })
     return pd.DataFrame(rows)
+
+
+def sonar_geometry(rec: dict) -> dict:
+    """Range and bearing axes of the raw ARIS frames (`aris_raw`, samples x beams) of one recording.
+
+    Returns {"ranges": (num_samples,) range of each row centre [m], "bearings": (128,) bearing of each
+    column [rad], positive to the right, i.e. descending: column 0 is the rightmost beam}.
+    The range window drifts by under a millimetre within a recording (sound speed), so the median is used.
+    """
+    meta = rec["frame_meta"]
+    assert (meta["PingMode"].isin([9, 10, 11, 12])).all(), "expected the 128-beam ping modes"
+    n = int(meta["SamplesPerBeam"].iloc[0])
+    assert (meta["SamplesPerBeam"] == n).all()
+    start, length = meta["WindowStart"].median(), meta["WindowLength"].median()
+    return {
+        "ranges": start + (np.arange(n) + 0.5) * length / n,
+        "bearings": -np.radians(ARIS_BEAMS_128_DEG),
+    }
 
 
 def label_box(label: dict) -> np.ndarray:
