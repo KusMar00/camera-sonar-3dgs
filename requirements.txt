@@ -20,3 +20,6 @@ fast-simplification
 scipy
 plotly
 nbformat
+
+# Interactive 3D views of the exported scenes
+rerun-sdk[notebook]
