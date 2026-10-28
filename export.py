@@ -185,36 +185,48 @@ def write_scene(out: Path, frames, *, K: np.ndarray, dist: np.ndarray, fisheye: 
 # Datasets
 
 
-def export_uxo(rec_path: Path, tfs: dict, K: np.ndarray, dist: np.ndarray, out_root: Path,
-               step: int = 1, **kwargs) -> dict:
+def export_uxo(rec_path: Path | list[Path], tfs: dict, K: np.ndarray, dist: np.ndarray, out_root: Path,
+               step: int = 1, name: str | None = None, **kwargs) -> dict:
     """Export one UXO recording: every `step`-th frame that has a GoPro image, a raw sonar frame and a pose.
 
     K, dist are the `wide` fisheye intrinsics. Sonar frames are the raw ARIS samples (`aris_raw`), not the
-    fan images in `aris_polar`.
+    fan images in `aris_polar`. A list of recordings of the same target (e.g. passes at several heights, all
+    in the gantry world) is merged into one scene called `name`; their sonar range windows must match.
+    Frames keep the recordings' order, listed in the top-level "recordings".
     """
-    rec = uxo.load_recording(Path(rec_path), polar=False)
-    poses = uxo.rig_poses(rec, tfs)
-    rows = [k for k, i in enumerate(poses["frame_idx"]) if i in rec["gopro_frames"] and i in rec["sonar_frames"]][::step]
-    geometry = uxo.sonar_geometry(rec)
+    paths = [Path(p) for p in rec_path] if isinstance(rec_path, (list, tuple)) else [Path(rec_path)]
+    recs = [uxo.load_recording(p, polar=False) for p in paths]
+    geometry = uxo.sonar_geometry(recs[0])
+    for rec in recs[1:]:
+        assert rec["target"] == recs[0]["target"], "recordings of different targets"
+        ranges = uxo.sonar_geometry(rec)["ranges"]
+        assert len(ranges) == len(geometry["ranges"]) and np.allclose(ranges, geometry["ranges"], atol=0.005), \
+            f"{rec['name']}: different sonar range window"
 
     def frames():
-        for k in rows:
-            i = poses["frame_idx"][k]
-            yield {
-                "image": cv2.cvtColor(cv2.imread(str(rec["gopro_frames"][i])), cv2.COLOR_BGR2RGB),
-                "sonar": cv2.imread(str(rec["sonar_frames"][i]), cv2.IMREAD_UNCHANGED),
-                "T_world_camera": poses["setup/camera"][k],
-                "T_world_sonar": poses["setup/sonar"][k],  # already x right, y down, z forward
-                "time": rec["frame_meta"].loc[i, "FrameTime"] / 1e6,
-                "source_index": i,
-            }
+        for rec in recs:
+            poses = uxo.rig_poses(rec, tfs)
+            rows = [k for k, i in enumerate(poses["frame_idx"]) if i in rec["gopro_frames"] and i in rec["sonar_frames"]][::step]
+            for k in rows:
+                i = poses["frame_idx"][k]
+                yield {
+                    "image": cv2.cvtColor(cv2.imread(str(rec["gopro_frames"][i])), cv2.COLOR_BGR2RGB),
+                    "sonar": cv2.imread(str(rec["sonar_frames"][i]), cv2.IMREAD_UNCHANGED),
+                    "T_world_camera": poses["setup/camera"][k],
+                    "T_world_sonar": poses["setup/sonar"][k],  # already x right, y down, z forward
+                    "time": rec["frame_meta"].loc[i, "FrameTime"] / 1e6,
+                    "source_index": i,
+                }
 
+    rec = recs[0]
+    name = name or rec["name"]
     return write_scene(
-        Path(out_root) / "uxo" / rec["name"], frames(), K=K, dist=dist, fisheye=True, image_size=(1920, 1080),
+        Path(out_root) / "uxo" / name, frames(), K=K, dist=dist, fisheye=True, image_size=(1920, 1080),
         sonar={**geometry, "model": "ARIS Explorer 3000 (128 beams)",
                "horizontal_fov": np.radians(uxo.SONAR_FOV_DEG["horizontal"]),
                "vertical_fov": np.radians(uxo.SONAR_FOV_DEG["vertical"])},
-        meta={"dataset": "uxo", "sequence": rec["name"], "target": rec["target"],
+        meta={"dataset": "uxo", "sequence": name, "target": rec["target"],
+              **({"recordings": [r["name"] for r in recs]} if len(recs) > 1 else {}),
               "target_transform_matrix": uxo.chain(tfs, rec["target_frame"], "world").tolist()},
         **kwargs,
     )

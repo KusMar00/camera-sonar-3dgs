@@ -6,3 +6,5 @@ __pycache__/
 # Datasets and generated outputs (large)
 data/
 prepared/
+outputs/
+renders/
