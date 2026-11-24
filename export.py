@@ -18,7 +18,8 @@ as-is. Per frame:
 Top level "sonar": "ranges" [m] of every row and "bearings" [rad] of every column (both ascending), and
 the horizontal and vertical aperture [rad].
 
-World frame: each dataset's own (UXO: gantry world, z up; opti-acoustic: SLAM odometry frame). Metres,
+World frame: each dataset's own (UXO: gantry world, z up; opti-acoustic: SLAM odometry frame; Sonar-MASt3R:
+arm base frame, z up). Metres,
 no rescaling or recentring.
 """
 
@@ -31,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 import opti
+import sonar_mast3r
 import uxo
 
 OPENCV_TO_OPENGL = np.diag([1.0, -1.0, -1.0, 1.0])  # flips camera y and z axes (right-multiply a c2w pose)
@@ -186,13 +188,15 @@ def write_scene(out: Path, frames, *, K: np.ndarray, dist: np.ndarray, fisheye: 
 
 
 def export_uxo(rec_path: Path | list[Path], tfs: dict, K: np.ndarray, dist: np.ndarray, out_root: Path,
-               step: int = 1, name: str | None = None, **kwargs) -> dict:
+               step: int = 1, name: str | None = None, init_half_size: float = 1.3, **kwargs) -> dict:
     """Export one UXO recording: every `step`-th frame that has a GoPro image, a raw sonar frame and a pose.
 
     K, dist are the `wide` fisheye intrinsics. Sonar frames are the raw ARIS samples (`aris_raw`), not the
     fan images in `aris_polar`. A list of recordings of the same target (e.g. passes at several heights, all
     in the gantry world) is merged into one scene called `name`; their sonar range windows must match.
     Frames keep the recordings' order, listed in the top-level "recordings".
+    "init_bounds" (random start points in the Z-Splat reader, no sensor prior): a cube of +-init_half_size [m]
+    around the target origin, as the earlier UXO scenes (prepare_uxo.ipynb step 6).
     """
     paths = [Path(p) for p in rec_path] if isinstance(rec_path, (list, tuple)) else [Path(rec_path)]
     recs = [uxo.load_recording(p, polar=False) for p in paths]
@@ -220,6 +224,7 @@ def export_uxo(rec_path: Path | list[Path], tfs: dict, K: np.ndarray, dist: np.n
 
     rec = recs[0]
     name = name or rec["name"]
+    target = uxo.chain(tfs, rec["target_frame"], "world")
     return write_scene(
         Path(out_root) / "uxo" / name, frames(), K=K, dist=dist, fisheye=True, image_size=(1920, 1080),
         sonar={**geometry, "model": "ARIS Explorer 3000 (128 beams)",
@@ -227,9 +232,58 @@ def export_uxo(rec_path: Path | list[Path], tfs: dict, K: np.ndarray, dist: np.n
                "vertical_fov": np.radians(uxo.SONAR_FOV_DEG["vertical"])},
         meta={"dataset": "uxo", "sequence": name, "target": rec["target"],
               **({"recordings": [r["name"] for r in recs]} if len(recs) > 1 else {}),
-              "target_transform_matrix": uxo.chain(tfs, rec["target_frame"], "world").tolist()},
+              "target_transform_matrix": target.tolist(),
+              "init_bounds": [(target[:3, 3] - init_half_size).tolist(), (target[:3, 3] + init_half_size).tolist()]},
         **kwargs,
     )
+
+
+def export_uxo_colmap(scene: Path, colmap_model: Path, tfs: dict, name: str | None = None) -> dict:
+    """COLMAP variant of an exported UXO scene (export_uxo): same images, sonar frames and start points (links),
+    only the poses change. As prepare_uxo.ipynb step 7 (user decision 2026-11-11: COLMAP poses, option A):
+
+      camera  COLMAP pose of every registered frame (run_colmap on this scene's images, camera held fixed),
+              similarity-aligned (Umeyama, positions only) to the scene's gantry camera positions: metres, gantry world
+      sonar   COLMAP camera pose x the calibration's camera -> sonar transform (transforms.yaml, setup/camera and
+              setup/sonar both under setup/ar3)
+    Why: the gantry orientations disagree with COLMAP by ~4.5 deg (part steady pitch, part varying with the rotator),
+    which blurred camera-only reconstructions even on training views. Unregistered frames are dropped.
+    Written next to `scene` as <scene>_colmap (or `name`).
+    """
+    scene = Path(scene)
+    meta = json.loads((scene / "transforms.json").read_text())
+    col = read_colmap_images(colmap_model)
+    keep = [(n, f) for n, f in enumerate(meta["frames"]) if Path(f["file_path"]).stem in col]
+    C = np.array([col[Path(f["file_path"]).stem] for _, f in keep])               # OpenCV camera axes
+    gantry = np.array([f["transform_matrix"] for _, f in keep]) @ OPENCV_TO_OPENGL   # back to OpenCV axes
+    scale, R, tr = umeyama(C[:, :3, 3], gantry[:, :3, 3])
+    T_wc = np.tile(np.eye(4), (len(C), 1, 1))
+    T_wc[:, :3, :3] = R @ C[:, :3, :3]
+    T_wc[:, :3, 3] = scale * (R @ C[:, :3, 3].T).T + tr
+    residual = np.linalg.norm(T_wc[:, :3, 3] - gantry[:, :3, 3], axis=1)
+    T_cam_sonar = np.linalg.inv(uxo.chain(tfs, "setup/camera", "setup/ar3")) @ uxo.chain(tfs, "setup/sonar", "setup/ar3")
+    # rotation between the gantry and the COLMAP camera orientation, per frame [deg]
+    dR = np.einsum("nji,njk->nik", gantry[:, :3, :3], T_wc[:, :3, :3])
+    angle = np.degrees(np.arccos(np.clip((np.trace(dR, axis1=1, axis2=2) - 1) / 2, -1, 1)))
+
+    out = scene.with_name(name or f"{scene.name}_colmap")
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    for d in ("images", "sonar", meta["ply_file_path"]):
+        (out / d).symlink_to(Path("..") / scene.name / d)
+    frames = [{**f, "transform_matrix": (T_wc[k] @ OPENCV_TO_OPENGL).tolist(),
+               "sonar_transform_matrix": (T_wc[k] @ T_cam_sonar).tolist()} for k, (_, f) in enumerate(keep)]
+    transforms = {**meta, "sequence": out.name, "frames": frames, "poses": {
+        "camera": "COLMAP (fixed pinhole camera), similarity-aligned to the gantry camera positions",
+        "sonar": "COLMAP camera pose x calibration camera -> sonar",
+        "colmap_model": str(colmap_model), "alignment_scale": float(scale), "alignment_R": R.tolist(),
+        "alignment_t": tr.tolist(),
+        "alignment_residual_m": {"median": float(np.median(residual)), "max": float(residual.max())},
+        "gantry_vs_colmap_rotation_deg": {"median": float(np.median(angle)), "max": float(angle.max())},
+        "T_camera_sonar": T_cam_sonar.tolist(),
+        "frames": f"{len(keep)} of {len(meta['frames'])} (COLMAP registered)"}}
+    (out / "transforms.json").write_text(json.dumps(transforms, indent=1))
+    return transforms
 
 
 def export_opti(bag: Path, out_root: Path, step: int = 1, pitch: bool = True, **kwargs) -> dict:
@@ -274,3 +328,203 @@ def export_opti(bag: Path, out_root: Path, step: int = 1, pitch: bool = True, **
         meta={"dataset": "opti_acoustic", "sequence": bag.stem, "scenario": bag.parent.name, "pitch": pitch},
         **kwargs,
     )
+
+
+def export_sonar_mast3r(seq: Path, calibration: Path, out_root: Path, step: int = 1, name: str | None = None,
+                        **kwargs) -> dict:
+    """Export one Sonar-MASt3R sequence from its bag export (prepare_sonar_mast3r.ipynb): every `step`-th camera
+    frame with its nearest sonar frame (fan image resampled to polar) and the forward-kinematics poses stamped at
+    each image.
+
+    Frames: dwe_cam is used as an OpenCV camera (z forward, x right, y down); oculus_link as a ROS sensor frame
+    (x forward = boresight, y left, z up), converted with the same axis swap as the opti-acoustic sonar.
+
+    Bearings are mirrored (fan image left = sonar right in this frame). Evidence, dataset1: bright returns of all
+    559 frames placed in the world at zero elevation form a sharp ring of 2.23 m diameter (the 2.1 m tank wall; zero
+    elevation overestimates it) with the mirror, and a 1.23 m smear without (densest 2% of 1 cm cells: 21% vs 16% of
+    the returns). Whether the viewer mirrors the fan or oculus_link has y right / z down cannot be told apart: they
+    differ by a 180 deg rotation about the boresight, which only flips the unmeasured elevation.
+    """
+    seq = Path(seq)
+    s = sonar_mast3r.load_sequence(seq)
+    K, dist, size = sonar_mast3r.load_calibration(calibration)
+    T_world_sonar = s["T_world_oculus"] @ T_FLU_RDF
+
+    def frames():
+        for i in range(0, len(s["t"]), step):
+            ci, si = s["cam_idx"][i], s["sonar_idx"][i]
+            yield {
+                "image": cv2.cvtColor(cv2.imread(str(seq / f"cam_frames/frame_{ci:06d}.png")), cv2.COLOR_BGR2RGB),
+                "sonar": sonar_mast3r.fan_to_polar(cv2.imread(str(seq / f"sonar_frames/frame_{si:06d}.png")))[:, ::-1],
+                "T_world_camera": s["T_world_dwe_cam"][i],
+                "T_world_sonar": T_world_sonar[i],
+                "time": s["t"][i],
+                "source_index": ci,
+            }
+
+    name = name or seq.name
+    return write_scene(Path(out_root) / "sonar_mast3r" / name, frames(), K=K, dist=dist, fisheye=False,
+                       image_size=size, sonar=_mast3r_sonar(), meta={**MAST3R_META, "sequence": name}, **kwargs)
+
+
+def _mast3r_sonar() -> dict:
+    ranges, bearings = sonar_mast3r.polar_axes()
+    return {"ranges": ranges, "bearings": bearings, "model": "Oculus M3000d (from fan video)",
+            "horizontal_fov": sonar_mast3r.HORIZONTAL_FOV, "vertical_fov": sonar_mast3r.VERTICAL_FOV}
+
+
+# init_bounds: box for random start points (Z-Splat reader, underwater-splatting/scene/sonar_camera_reader.py): the 2.1 m tank (centre at (0.64, -0.04) m, fitted to
+# the sonar wall echoes) from below the floor (z ~ -0.30 m, mode of the sonar returns) to above the camera path
+# (z 0.30-0.42 m). Arm base frame of dataset1.
+MAST3R_META = {"dataset": "sonar_mast3r", "init_bounds": [[-0.45, -1.15, -0.45], [1.75, 1.05, 0.50]]}
+
+
+def _interp_poses(t: np.ndarray, T: np.ndarray, tq: np.ndarray) -> np.ndarray:
+    """4x4 poses T (N, 4, 4) at increasing times t, interpolated at times tq: positions linear, rotations slerp."""
+    from scipy.spatial.transform import Rotation, Slerp
+
+    out = np.tile(np.eye(4), (len(tq), 1, 1))
+    out[:, :3, :3] = Slerp(t, Rotation.from_matrix(T[:, :3, :3]))(tq).as_matrix()
+    out[:, :3, 3] = np.stack([np.interp(tq, t, T[:, i, 3]) for i in range(3)], axis=1)
+    return out
+
+
+def export_sonar_mast3r_colmap(seq: Path, calibration: Path, colmap_model: Path, out_root: Path,
+                               name: str | None = None, camera_latency: float = 0.185, sonar_latency: float = 0.110,
+                               max_gap: float = 0.25, **kwargs) -> dict:
+    """Export a Sonar-MASt3R sequence with COLMAP camera poses and a timing model for both sensors.
+
+    Why: the forward-kinematics (FK) camera poses disagree with COLMAP by 2.2 cm / 4.2 deg (median, dataset1). Most of
+    it is timing: the images are ~185 ms older than their stamps (COLMAP vs FK, position error 2.15 -> 0.40 cm when
+    the FK poses are shifted), the sonar frames ~110 ms (sharpest world map of the sonar returns, broad optimum).
+    ~2 deg of FK rotation error remains after the shift, so the camera poses come from COLMAP, not from FK.
+
+    colmap_model: COLMAP text model run on the images of the FK export (export_sonar_mast3r, step 1), so an image
+    name is the camera frame index; the camera model was held fixed to that export's pinhole camera.
+      camera   COLMAP pose of every registered frame, similarity-aligned (Umeyama, positions only) to the FK camera
+               positions at the frame's true capture time (stamp - camera_latency): metres, arm base frame.
+      pairing  each camera frame gets the sonar frame closest in true time (sonar stamp - sonar_latency).
+      sonar    the aligned COLMAP camera trajectory interpolated at the sonar frame's true time, times the fixed
+               camera -> sonar transform of the FK model (median translation, mean rotation over all frames; FK
+               camera and sonar poses compared at the same instant). Frames whose sonar time is not between two
+               registered camera frames at most `max_gap` apart are dropped (no interpolation across gaps).
+    Frame conventions and the bearing mirror as in export_sonar_mast3r.
+    """
+    seq = Path(seq)
+    p = np.load(seq / "poses.npz")
+    t0 = p["cam_stamp_ns"][0]
+    tc_stamp, ts_stamp = (p["cam_stamp_ns"] - t0) / 1e9, (p["sonar_stamp_ns"] - t0) / 1e9
+    tc, ts = tc_stamp - camera_latency, ts_stamp - sonar_latency                      # true capture times
+    T_fk_cam = sonar_mast3r.pose_matrices(p["cam_pos"], p["cam_quat"])
+    T_fk_son = sonar_mast3r.pose_matrices(p["sonar_pos"], p["sonar_quat"]) @ T_FLU_RDF
+
+    # camera -> sonar of the FK model: both FK poses at the camera stamps (FK poses are timed by their stamps)
+    from scipy.spatial.transform import Rotation
+    inside = (tc_stamp >= ts_stamp[0]) & (tc_stamp <= ts_stamp[-1])
+    T_cs = np.linalg.inv(T_fk_cam[inside]) @ _interp_poses(ts_stamp, T_fk_son, tc_stamp[inside])
+    T_cam_sonar = np.eye(4)
+    T_cam_sonar[:3, :3] = Rotation.from_matrix(T_cs[:, :3, :3]).mean().as_matrix()
+    T_cam_sonar[:3, 3] = np.median(T_cs[:, :3, 3], axis=0)
+
+    # COLMAP camera poses, aligned to the FK camera positions at the true capture times
+    col = read_colmap_images(colmap_model)
+    reg = np.array(sorted(int(k) for k in col))
+    C = np.array([col[f"{i:06d}"] for i in reg])
+    fk_pos = _interp_poses(tc_stamp, T_fk_cam, np.clip(tc[reg], tc_stamp[0], tc_stamp[-1]))[:, :3, 3]
+    scale, R, tr = umeyama(C[:, :3, 3], fk_pos)
+    T_wc = np.tile(np.eye(4), (len(reg), 1, 1))
+    T_wc[:, :3, :3] = R @ C[:, :3, :3]
+    T_wc[:, :3, 3] = scale * (R @ C[:, :3, 3].T).T + tr
+    residual = np.linalg.norm(T_wc[:, :3, 3] - fk_pos, axis=1)
+
+    # pairing in true time, sonar pose from the camera trajectory at the sonar's true time
+    k = np.clip(np.searchsorted(ts, tc[reg]), 1, len(ts) - 1)
+    son = np.where(np.abs(ts[k] - tc[reg]) < np.abs(ts[k - 1] - tc[reg]), k, k - 1)
+    b = np.searchsorted(tc[reg], ts[son])                                              # bracketing camera frames
+    ok = (b > 0) & (b < len(reg))
+    ok[ok] &= (tc[reg][b[ok]] - tc[reg][b[ok] - 1]) <= max_gap
+    T_ws = _interp_poses(tc[reg], T_wc, ts[son][ok]) @ T_cam_sonar
+    K, dist, size = sonar_mast3r.load_calibration(calibration)
+
+    def frames():
+        for n, (ci, si) in enumerate(zip(reg[ok], son[ok])):
+            yield {
+                "image": cv2.cvtColor(cv2.imread(str(seq / f"cam_frames/frame_{ci:06d}.png")), cv2.COLOR_BGR2RGB),
+                "sonar": sonar_mast3r.fan_to_polar(cv2.imread(str(seq / f"sonar_frames/frame_{si:06d}.png")))[:, ::-1],
+                "T_world_camera": T_wc[ok][n],
+                "T_world_sonar": T_ws[n],
+                "time": tc_stamp[ci],
+                "source_index": int(ci),
+            }
+
+    name = name or f"{seq.name.removesuffix('_bag')}_colmap"
+    meta = {**MAST3R_META, "sequence": name, "poses": {
+        "camera": "COLMAP (fixed intrinsics), similarity-aligned to FK camera positions at true capture time",
+        "sonar": "COLMAP camera trajectory at the sonar's true time x FK camera->sonar",
+        "colmap_model": str(colmap_model), "camera_latency_s": camera_latency, "sonar_latency_s": sonar_latency,
+        "alignment_scale": float(scale), "alignment_R": R.tolist(), "alignment_t": tr.tolist(),
+        "alignment_residual_m": {"median": float(np.median(residual)), "max": float(residual.max())},
+        "T_camera_sonar": T_cam_sonar.tolist(),
+        "frames": f"{ok.sum()} of {len(tc)} camera frames (COLMAP registered {len(reg)}; "
+                  f"{(~ok).sum()} dropped: sonar time in a gap of unregistered frames)"}}
+    return write_scene(Path(out_root) / "sonar_mast3r" / name, frames(), K=K, dist=dist, fisheye=False,
+                       image_size=size, sonar=_mast3r_sonar(), meta=meta, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# COLMAP poses
+
+
+def run_colmap(scene: Path, out: Path, colmap: str = "colmap", gpu: bool = False) -> Path:
+    """Structure from motion on an exported scene's images with its pinhole camera held FIXED (no focal, principal
+    point or distortion refinement), as prepare_uxo.ipynb step 7: single camera, exhaustive matching, mapper.
+    Writes <out>/sparse/<model>/ as text and returns the largest model's folder. An existing `out` is replaced.
+    Image names are the scene's (000000.jpg, ...), so a COLMAP image name is the scene frame number."""
+    import subprocess
+
+    meta = json.loads((Path(scene) / "transforms.json").read_text())
+    out = Path(out)
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "sparse").mkdir(parents=True)
+    db, images = str(out / "database.db"), str(Path(scene).resolve() / "images")
+    run = lambda *a: subprocess.run([colmap, *a], check=True, capture_output=True, text=True)
+    run("feature_extractor", "--database_path", db, "--image_path", images,
+        "--ImageReader.camera_model", "PINHOLE", "--ImageReader.single_camera", "1",
+        "--ImageReader.camera_params", ",".join(f"{meta[k]:.6f}" for k in ("fl_x", "fl_y", "cx", "cy")),
+        "--SiftExtraction.use_gpu", str(int(gpu)))
+    run("exhaustive_matcher", "--database_path", db, "--SiftMatching.use_gpu", str(int(gpu)))
+    run("mapper", "--database_path", db, "--image_path", images, "--output_path", str(out / "sparse"),
+        "--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_principal_point", "0",
+        "--Mapper.ba_refine_extra_params", "0")
+    models = sorted((out / "sparse").iterdir())
+    for m in models:
+        run("model_converter", "--input_path", str(m), "--output_path", str(m), "--output_type", "TXT")
+    return max(models, key=lambda m: len(read_colmap_images(m)))
+
+
+def read_colmap_images(model_dir: Path) -> dict[str, np.ndarray]:
+    """images.txt of a COLMAP text model -> {image name stem: camera-to-world 4x4, OpenCV camera axes}.
+    COLMAP stores world-to-camera as quaternion (w first) and translation."""
+    from scipy.spatial.transform import Rotation
+
+    lines = [l for l in (Path(model_dir) / "images.txt").read_text().splitlines() if not l.startswith("#")]
+    poses = {}
+    for l in lines[::2]:
+        v = l.split()
+        w2c = np.eye(4)
+        w2c[:3, :3] = Rotation.from_quat([float(v[2]), float(v[3]), float(v[4]), float(v[1])]).as_matrix()
+        w2c[:3, 3] = [float(x) for x in v[5:8]]
+        poses[Path(v[9]).stem] = np.linalg.inv(w2c)
+    return poses
+
+
+def umeyama(src: np.ndarray, dst: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Similarity (s, R, t) minimising sum |s R src + t - dst|^2 over point pairs (Umeyama 1991), no reflection."""
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    a, b = src - mu_s, dst - mu_d
+    U, S, Vt = np.linalg.svd(b.T @ a / len(src))
+    D = np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))])
+    R = U @ D @ Vt
+    s = np.trace(np.diag(S) @ D) / (a ** 2).sum(1).mean()
+    return s, R, mu_d - s * R @ mu_s
+

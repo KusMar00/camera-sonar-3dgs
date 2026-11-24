@@ -57,8 +57,12 @@ ARIS_BEAMS_128_DEG = np.array([
      11.5177,  11.7529,  11.9879,  12.2226,  12.4570,  12.6911,  12.9249,  13.1584,
      13.3916,  13.6246,  13.8574,  14.0899,  14.3221,  14.5538,  14.7850,  15.0156,
 ])
-# ARIS Explorer 3000 apertures (manufacturer spec, 3 MHz / 128 beams)
-SONAR_FOV_DEG = {"horizontal": 30.0, "vertical": 14.0}
+# Outer edges of the first and last beam [deg], same source as ARIS_BEAMS_128_DEG (BeamWidthsAris3000_128).
+ARIS_BEAM_EDGES_128_DEG = (-15.1218, 15.1306)
+# ARIS Explorer 3000 apertures: horizontal = twice the larger outer beam edge (30.26 deg; the spec sheet rounds to 30),
+# so a pinhole view centred on the boresight contains every beam; vertical = 15 deg from the SoundMetrics ARIS Explorer 3000 spec sheet (checked by the author 2026-11-24;
+# an earlier 14 here was wrong).
+SONAR_FOV_DEG = {"horizontal": 2 * max(abs(e) for e in ARIS_BEAM_EDGES_128_DEG), "vertical": 15.0}
 
 
 # ---------------------------------------------------------------------------

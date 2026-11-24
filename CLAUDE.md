@@ -39,10 +39,13 @@ don't pick silently.
 
 - `uxo.py`: UXO dataset loading (ARIS Explorer 3000 sonar, GoPro, gantry poses, transforms).
 - `opti.py`: opti-acoustic dataset loading (ROS bags, Oculus M750d sonar, SLAM odometry).
+- `sonar_mast3r.py`: Sonar-MASt3R dataset (Oculus M3000d fan video from the authors' ROS bags): measured fan
+  geometry and fan -> polar resampling. `prepare_sonar_mast3r.ipynb`: bag export, rectification, Rerun, polar check.
 - `export.py`: exports both datasets to one common scene format under `prepared/<dataset>/<sequence>/`;
   its module docstring defines the layout and all frame conventions. Read it before touching geometry.
-- `zsplat_reader.py`: reads an exported scene into Z-Splat (sonar as a pinhole view + per-column depth
-  histograms).
+- Method code (Z-Splat and our changes) lives in its own repo, `~/Dev/underwater-splatting` (first commit = Z-Splat
+  upstream unchanged, so `git diff` of that commit shows all thesis changes). Its `scene/sonar_camera_reader.py`
+  reads the exported scenes into Z-Splat (sonar as a pinhole view + per-column range histograms).
 - `viz.py`: Rerun visualisation of exported scenes, showing exactly what a 3DGS method receives.
 - `prepare_datasets.ipynb`: download, inspect and export the datasets.
 
